@@ -13,3 +13,9 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Large local GGUF weights (APK Zip32 cannot package a single file > ~4GB)
+*.gguf
+app/src/main/assets/*.gguf
+.idea/
+app/src/main/java/com/example/cagent/res.txt
