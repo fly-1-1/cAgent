@@ -201,6 +201,53 @@ static std::vector<jchar> utf8_to_utf16(const std::string & s) {
     return u16;
 }
 
+// Returns the length (in bytes) of the largest prefix that does not end in the
+// middle of a UTF-8 multi-byte sequence. This is used for streaming: llama.cpp
+// token pieces can split multi-byte characters (e.g. Chinese) across tokens.
+static size_t utf8_safe_prefix_len(const std::string & s) {
+    const unsigned char * p = (const unsigned char *) s.data();
+    const unsigned char * end = p + s.size();
+    size_t consumed = 0;
+    while (p < end) {
+        unsigned char c = *p;
+        int len = 1;
+        if (c < 0x80) {
+            len = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            len = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            len = 4;
+        } else {
+            len = 1;
+        }
+
+        if (p + len > end) {
+            // Incomplete at end: stop.
+            break;
+        }
+
+        bool ok = true;
+        for (int i = 1; i < len; i++) {
+            if ((p[i] & 0xC0) != 0x80) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            // Invalid lead byte or continuation: consume 1 byte and continue.
+            p += 1;
+            consumed += 1;
+            continue;
+        }
+
+        p += len;
+        consumed += (size_t) len;
+    }
+    return consumed;
+}
+
 static jstring make_jstring(JNIEnv * env, const std::string & s) {
     auto u16 = utf8_to_utf16(s);
     return env->NewString(u16.data(), (jsize) u16.size());
@@ -233,8 +280,7 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
 
     auto invoke_cb = [&](const std::string & piece) -> bool {
         if (callback == nullptr || cb_onTok == nullptr) return true;
-        // Build a jstring from the partial piece (may itself be invalid UTF-8
-        // mid-character; utf8_to_utf16 handles that by emitting U+FFFD).
+        // Build a jstring from a UTF-8-safe chunk.
         jstring jpiece = make_jstring(env, piece);
         jboolean keepGoing = env->CallBooleanMethod(callback, cb_onTok, jpiece);
         if (jpiece) env->DeleteLocalRef(jpiece);
@@ -245,6 +291,19 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
             return false;
         }
         return keepGoing != JNI_FALSE;
+    };
+
+    // Buffer streaming pieces to avoid splitting multi-byte UTF-8 characters
+    // across callback boundaries (which would show as garbled text).
+    std::string pending_utf8;
+    auto stream_piece = [&](const std::string & piece) -> bool {
+        if (callback == nullptr || cb_onTok == nullptr) return true;
+        pending_utf8 += piece;
+        const size_t safe = utf8_safe_prefix_len(pending_utf8);
+        if (safe == 0) return true;
+        const std::string chunk = pending_utf8.substr(0, safe);
+        pending_utf8.erase(0, safe);
+        return invoke_cb(chunk);
     };
 
     try {
@@ -381,7 +440,7 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
 
         // Stream this piece to Java; if the callback throws or returns false,
         // bail out gracefully (still keep what we already have in `out`).
-        if (!invoke_cb(piece)) {
+        if (!stream_piece(piece)) {
             __android_log_print(ANDROID_LOG_INFO, TAG, "complete: callback requested stop at i=%d", i);
             break;
         }
@@ -412,6 +471,12 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
         __android_log_print(ANDROID_LOG_INFO, TAG,
                             "complete: generated tokens=%d out_bytes=%zu first_hex=%s",
                             n_generated, out.size(), hex);
+    }
+
+    // Flush any pending UTF-8 bytes (incomplete multi-byte sequence).
+    if (!pending_utf8.empty()) {
+        invoke_cb(pending_utf8);
+        pending_utf8.clear();
     }
 
     // Use NewString (UTF-16) instead of NewStringUTF: NewStringUTF expects
