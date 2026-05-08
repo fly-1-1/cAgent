@@ -10,7 +10,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -34,6 +36,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.cagent.model.Role
+import kotlinx.coroutines.delay
 @Composable
 fun ChatScreen(
     onOpenModels: () -> Unit,
@@ -46,14 +49,16 @@ fun ChatScreen(
         vm.loadDefaultModelIfPresent()
     }
 
-    // Auto-scroll to the latest message when the list grows or the last
-    // message's text grows (streaming token append).
+    // Auto-scroll during streaming only while the user stays pinned to the bottom.
+    // animateScrollToItem() aligns the *top* of the last bubble to the viewport top,
+    // which fights the user when reading a long reply — they scroll down and each
+    // token snaps them back to the top of the message.
     val lastIndex = state.messages.lastIndex.coerceAtLeast(0)
     val lastLen = state.messages.lastOrNull()?.text?.length ?: 0
     LaunchedEffect(lastIndex, lastLen) {
-        if (state.messages.isNotEmpty()) {
-            listState.animateScrollToItem(lastIndex)
-        }
+        if (state.messages.isEmpty()) return@LaunchedEffect
+        if (listState.canScrollForward) return@LaunchedEffect
+        scrollStreamingTailToBottom(listState, lastIndex)
     }
 
     Column(
@@ -103,6 +108,27 @@ fun ChatScreen(
                 }
             }
         }
+    }
+}
+
+/**
+ * Keeps the bottom edge of the last list item near the viewport bottom while tokens stream in.
+ * Uses scrollToItem + a small scrollBy nudge instead of animateScrollToItem, which pins the item top.
+ */
+private suspend fun scrollStreamingTailToBottom(listState: LazyListState, lastIndex: Int) {
+    listState.scrollToItem(lastIndex)
+    repeat(8) {
+        val info = listState.layoutInfo
+        val item = info.visibleItemsInfo.find { it.index == lastIndex }
+        if (item != null) {
+            val gapPx = item.offset + item.size - info.viewportEndOffset
+            if (gapPx <= 2) return
+            listState.scroll {
+                scrollBy(gapPx.toFloat())
+            }
+            return
+        }
+        delay(8)
     }
 }
 
