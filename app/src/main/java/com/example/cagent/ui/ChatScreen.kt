@@ -92,11 +92,15 @@ fun ChatScreen(
                 placeholder = { Text("Type message…") },
                 singleLine = true,
             )
-            Button(
-                onClick = { vm.send() },
-                enabled = state.canSend,
-            ) {
-                Text("Send")
+            if (state.isGenerating) {
+                Button(onClick = { vm.stop() }) { Text("Stop") }
+            } else {
+                Button(
+                    onClick = { vm.send() },
+                    enabled = state.canSend,
+                ) {
+                    Text("Send")
+                }
             }
         }
     }

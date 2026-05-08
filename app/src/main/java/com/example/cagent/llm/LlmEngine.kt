@@ -20,6 +20,7 @@ class LlmEngine {
 
     external fun init(modelPath: String, contextLen: Int): Long
     external fun free(handle: Long)
+    external fun abort(handle: Long)
 
     /**
      * Run a chat-completion turn. The full reply is also returned at the end

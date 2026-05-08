@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <ctime>
 #include <exception>
@@ -22,6 +23,7 @@ namespace {
         llama_context * ctx   = nullptr;
         llama_sampler * smpl  = nullptr;
         const llama_vocab * vocab = nullptr;
+        std::atomic<bool> abort{false};
 
         ~Engine() {
             if (smpl)  llama_sampler_free(smpl);
@@ -77,9 +79,16 @@ Java_com_example_cagent_llm_LlmEngine_init(JNIEnv *env, jobject /*thiz*/, jstrin
         // Clamp n_ctx so we don't blow the device's RAM with a giant KV cache.
         const uint32_t requestedCtx = (uint32_t) std::max(256, contextLen);
         cparams.n_ctx = std::min<uint32_t>(requestedCtx, 4096);
+        // OpenCL path: prefer higher batch + offload attention for speed.
+#if defined(GGML_OPENCL)
         cparams.n_batch = 256;
         cparams.n_ubatch = 256;
+        cparams.offload_kqv = true;
+#else
+        cparams.n_batch = 128;
+        cparams.n_ubatch = 128;
         cparams.offload_kqv = false;
+#endif
         cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
         llama_context * ctx = llama_init_from_model(model, cparams);
@@ -90,9 +99,12 @@ Java_com_example_cagent_llm_LlmEngine_init(JNIEnv *env, jobject /*thiz*/, jstrin
         }
 
         const long online = sysconf(_SC_NPROCESSORS_ONLN);
-        const int threads = (int) std::clamp<long>(online > 0 ? online / 4 : 2, 2, 4);
+        // If GPU offload partially falls back to CPU kernels, 2 threads is often
+        // too conservative for 7B; use more cores without saturating all cores.
+        const int threads = (int) std::clamp<long>(online > 0 ? online / 2 : 4, 3, 6);
         llama_set_n_threads(ctx, threads, threads);
-        __android_log_print(ANDROID_LOG_INFO, TAG, "threads=%d", threads);
+        __android_log_print(ANDROID_LOG_INFO, TAG, "threads=%d n_batch=%u n_ubatch=%u",
+                            threads, cparams.n_batch, cparams.n_ubatch);
 
         // Lower the calling thread's scheduling priority (nice +5) so that
         // when llama.cpp / ggml saturates the CPU during prefill or decode,
@@ -166,6 +178,13 @@ Java_com_example_cagent_llm_LlmEngine_free(JNIEnv *env, jobject /*thiz*/, jlong 
     (void) env;
     auto * e = (Engine *) (uintptr_t) handle;
     delete e;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_cagent_llm_LlmEngine_abort(JNIEnv *env, jobject /*thiz*/, jlong handle) {
+    (void) env;
+    auto * e = (Engine *) (uintptr_t) handle;
+    if (e) e->abort.store(true, std::memory_order_relaxed);
 }
 
 // UTF-8 -> UTF-16 (jchar) conversion, used to build a jstring without the
@@ -261,6 +280,9 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
     if (!e || !e->ctx || !e->model || !e->vocab || !e->smpl) {
         return env->NewStringUTF("Engine not initialized");
     }
+
+    // Reset abort flag for this turn.
+    e->abort.store(false, std::memory_order_relaxed);
 
     // Resolve TokenCallback.onToken once for this call.
     jclass    cb_cls   = nullptr;
@@ -384,16 +406,9 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
     // Reset sampler for a fresh completion
     llama_sampler_reset(e->smpl);
 
-    // Decode prompt
-    llama_batch batch = llama_batch_init((int32_t) tokens.size(), 0, 1);
-    batch.n_tokens = (int32_t) tokens.size();
-    for (int i = 0; i < batch.n_tokens; i++) {
-        batch.token[i] = tokens[i];
-        batch.pos[i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i] = (i == batch.n_tokens - 1) ? 1 : 0;
-    }
+    // Decode prompt in chunks so we can respond to Stop during prefill.
+    const int32_t n_tok_all = (int32_t) tokens.size();
+    const int32_t chunk_cap = std::max<int32_t>(1, llama_n_batch(e->ctx));
 
     auto now_ms = []() -> int64_t {
         timespec ts{};
@@ -402,9 +417,29 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
     };
     __android_log_print(ANDROID_LOG_INFO, TAG, "complete: prefill begin (n_tok=%d)…", n_tok);
     const int64_t t_prefill_start = now_ms();
-    const int32_t rc = llama_decode(e->ctx, batch);
+    int32_t rc = 0;
+    for (int32_t start = 0; start < n_tok_all; start += chunk_cap) {
+        if (e->abort.load(std::memory_order_relaxed)) {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "complete: aborted during prefill");
+            rc = 0;
+            break;
+        }
+        const int32_t n_chunk = std::min<int32_t>(chunk_cap, n_tok_all - start);
+        llama_batch batch = llama_batch_init(n_chunk, 0, 1);
+        batch.n_tokens = n_chunk;
+        for (int i = 0; i < n_chunk; i++) {
+            batch.token[i] = tokens[start + i];
+            batch.pos[i] = start + i;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            const bool last_token = (start + i) == (n_tok_all - 1);
+            batch.logits[i] = last_token ? 1 : 0;
+        }
+        rc = llama_decode(e->ctx, batch);
+        llama_batch_free(batch);
+        if (rc != 0) break;
+    }
     const int64_t t_prefill_end = now_ms();
-    llama_batch_free(batch);
     if (rc != 0) {
         __android_log_print(ANDROID_LOG_ERROR, TAG, "llama_decode(prompt) rc=%d", rc);
         return env->NewStringUTF("Decode prompt failed");
@@ -418,8 +453,16 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
     out.reserve(1024);
 
     int n_generated = 0;
-    int max_tokens = 256;
+    // Prevent answers from being cut off too early. 256 is often insufficient
+    // for code-heavy responses. Keep this conservative for mobile RAM.
+    const int max_tokens = 768;
+    bool hit_token_limit = true;
     for (int i = 0; i < max_tokens; i++) {
+        if (e->abort.load(std::memory_order_relaxed)) {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "complete: aborted during generation");
+            hit_token_limit = false;
+            break;
+        }
         const llama_token next = llama_sampler_sample(e->smpl, e->ctx, -1);
         llama_sampler_accept(e->smpl, next);
 
@@ -431,6 +474,7 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
         // Use is_eog so we cover all end-of-generation tokens the model
         // declares (Qwen exposes both <|im_end|> and <|endoftext|>).
         if (llama_vocab_is_eog(e->vocab, next)) {
+            hit_token_limit = false;
             break;
         }
 
@@ -457,6 +501,7 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
         llama_batch_free(b2);
         if (rc2 != 0) {
             __android_log_print(ANDROID_LOG_ERROR, TAG, "llama_decode(gen) rc=%d", rc2);
+            hit_token_limit = false;
             break;
         }
     }
@@ -471,6 +516,14 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
         __android_log_print(ANDROID_LOG_INFO, TAG,
                             "complete: generated tokens=%d out_bytes=%zu first_hex=%s",
                             n_generated, out.size(), hex);
+    }
+
+    if (hit_token_limit && n_generated >= max_tokens) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "complete: stopped at max_tokens=%d (truncated)", max_tokens);
+        // Hint in the UI without being too noisy.
+        const char * suffix = "\n\n[truncated]";
+        out += suffix;
+        stream_piece(suffix);
     }
 
     // Flush any pending UTF-8 bytes (incomplete multi-byte sequence).

@@ -9,6 +9,7 @@ import com.example.cagent.model.ChatMessage
 import com.example.cagent.model.Role
 import com.example.cagent.storage.ModelStore
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,6 +25,7 @@ data class ChatUiState(
     val draft: String,
     val status: String,
     val canSend: Boolean,
+    val isGenerating: Boolean,
 )
 
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
@@ -31,6 +33,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val engine = LlmEngine()
 
     @Volatile private var handle: Long = 0L
+    @Volatile private var stopRequested: Boolean = false
+    @Volatile private var activeGeneration: Job? = null
 
     // All native engine calls (init / complete / free) MUST run on the same
     // dedicated thread. llama.cpp internal state is not safe to touch from
@@ -49,6 +53,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             draft = "",
             status = "Model not loaded",
             canSend = false,
+            isGenerating = false,
         )
     )
     val state: StateFlow<ChatUiState> = _state
@@ -66,9 +71,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
-        val sizeMb = f.length() / (1024 * 1024)
+        val modelBytes = f.length()
+        val sizeMb = modelBytes / (1024 * 1024)
+        // 7B Q4_K_M (~3.5-4.5GB) on phone GPUs can become memory-bound.
+        // Use a smaller KV cache for large models to reduce prefill latency.
+        val targetCtx = if (modelBytes >= LARGE_MODEL_BYTES) LARGE_MODEL_CTX else DEFAULT_CTX
         _state.value = _state.value.copy(
-            status = "Loading model… ${sizeMb} MB. This can take 30–60s on first run.",
+            status = "Loading model… ${sizeMb} MB (n_ctx=$targetCtx). This can take 30–60s on first run.",
             canSend = false,
         )
 
@@ -76,7 +85,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val h = withContext(llmDispatcher) {
                 try {
                     Log.i(tag, "engine.init path=${f.absolutePath} size=${f.length()}")
-                    engine.init(f.absolutePath, DEFAULT_CTX)
+                    engine.init(f.absolutePath, targetCtx)
                 } catch (t: Throwable) {
                     // Catches UnsatisfiedLinkError / OOM / generic Throwable.
                     // Native SIGSEGV would still kill the process; this only
@@ -94,7 +103,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     canSend = false,
                 )
             } else {
-                _state.value.copy(status = "Model loaded. (n_ctx=$DEFAULT_CTX)", canSend = true)
+                _state.value.copy(status = "Model loaded. (n_ctx=$targetCtx)", canSend = true)
             }
         }
     }
@@ -117,6 +126,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             _state.value = _state.value.copy(status = "Model not loaded yet.")
             return
         }
+        if (_state.value.isGenerating) return
+        stopRequested = false
 
         // The empty assistant message we'll stream into. Tracked by id so we
         // can update it from arbitrary positions in the list.
@@ -130,9 +141,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 assistantMsg,
             status = "Generating…",
             canSend = false,
+            isGenerating = true,
         )
 
-        viewModelScope.launch {
+        activeGeneration = viewModelScope.launch {
             val tStart = System.currentTimeMillis()
 
             // Status ticker so the user sees progress during a long first-time
@@ -151,6 +163,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // Streaming callback — invoked on the engine thread, NOT the UI thread.
             // Mutating StateFlow.value from any thread is safe.
             val callback = LlmEngine.TokenCallback { piece ->
+                if (stopRequested) return@TokenCallback false
                 _state.update { current ->
                     val updated = current.messages.map { m ->
                         if (m.id == assistantId) m.copy(text = m.text + piece) else m
@@ -200,10 +213,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
             Log.i(tag, "complete done elapsedMs=$elapsedMs streamedLen=${streamed.length} rawLen=${raw?.length ?: 0}")
 
+            val wasStopped = stopRequested
+            activeGeneration = null
             _state.value = _state.value.copy(
-                status = "Ready (${elapsedMs / 1000}s)",
+                status = if (wasStopped) "Stopped (${elapsedMs / 1000}s)" else "Ready (${elapsedMs / 1000}s)",
                 canSend = true,
+                isGenerating = false,
             )
+        }
+    }
+
+    fun stop() {
+        if (!_state.value.isGenerating) return
+        stopRequested = true
+        _state.value = _state.value.copy(status = "Stopping…")
+        val h = handle
+        if (h != 0L) {
+            viewModelScope.launch {
+                withContext(llmDispatcher) {
+                    try {
+                        engine.abort(h)
+                    } catch (t: Throwable) {
+                        Log.w(tag, "engine.abort threw", t)
+                    }
+                }
+            }
         }
     }
 
@@ -226,5 +260,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // 2048 is a safe ceiling for 7B Q4_K_M on most 12-16 GB phones.
         // Bump to 4096 once you've confirmed the model + device are stable.
         private const val DEFAULT_CTX = 2048
+        private const val LARGE_MODEL_CTX = 1024
+        private const val LARGE_MODEL_BYTES = 3_000_000_000L
     }
 }
