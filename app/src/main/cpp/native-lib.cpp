@@ -274,7 +274,7 @@ static jstring make_jstring(JNIEnv * env, const std::string & s) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
-                                               jlong handle, jstring prompt,
+                                               jlong handle, jstring messages,
                                                jobject callback /* TokenCallback or null */) {
     auto * e = (Engine *) (uintptr_t) handle;
     if (!e || !e->ctx || !e->model || !e->vocab || !e->smpl) {
@@ -283,6 +283,11 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
 
     // Reset abort flag for this turn.
     e->abort.store(false, std::memory_order_relaxed);
+
+    // Clear KV/memory so each call is an independent chat turn.
+    // Without this, subsequent calls re-use old KV cache contents and
+    // llama_decode(prompt) can fail when we restart positions from 0.
+    llama_memory_clear(llama_get_memory(e->ctx), true);
 
     // Resolve TokenCallback.onToken once for this call.
     jclass    cb_cls   = nullptr;
@@ -330,14 +335,49 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
 
     try {
 
-    // Clear KV/memory so each call is an independent chat turn for now.
-    llama_memory_clear(llama_get_memory(e->ctx), true);
+    const char * cMessages = env->GetStringUTFChars(messages, nullptr);
+    std::string messagesStr = cMessages ? cMessages : "";
+    env->ReleaseStringUTFChars(messages, cMessages);
 
-    const char * cPrompt = env->GetStringUTFChars(prompt, nullptr);
-    std::string userText = cPrompt ? cPrompt : "";
-    env->ReleaseStringUTFChars(prompt, cPrompt);
+    // Parse SOH-delimited format: \x01{role}\x01{content}\x01{role}\x01{content}\x01...
+    std::vector<llama_chat_message> chat_msgs;
+    std::vector<std::string> role_storage;
+    std::vector<std::string> content_storage;
 
-    const char * sysText = "You are a helpful bilingual assistant (中文/English).";
+    const char * p = messagesStr.data();
+    const char * end = p + messagesStr.size();
+
+    while (p < end) {
+        if (*p == '\x01') { p++; }
+        if (p >= end) break;
+
+        const char * role_start = p;
+        while (p < end && *p != '\x01') { p++; }
+        std::string role(role_start, p);
+
+        if (p < end) { p++; }
+        if (p >= end) break;
+
+        const char * content_start = p;
+        while (p < end && *p != '\x01') { p++; }
+        std::string content(content_start, p);
+
+        role_storage.emplace_back(std::move(role));
+        content_storage.emplace_back(std::move(content));
+
+        llama_chat_message msg;
+        msg.role    = role_storage.back().c_str();
+        msg.content = content_storage.back().c_str();
+        chat_msgs.push_back(msg);
+    }
+
+    if (chat_msgs.empty()) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "complete: no messages parsed");
+        return env->NewStringUTF("No messages provided");
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, TAG,
+                        "complete: %zu messages from history", chat_msgs.size());
 
     // Prefer the model's built-in chat template when the GGUF provides one.
     // Otherwise fall back to a hand-written ChatML string.
@@ -345,18 +385,12 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
     {
         const char * tmpl = llama_model_chat_template(e->model, nullptr);
         if (tmpl) {
-            llama_chat_message msgs[2];
-            msgs[0].role    = "system";
-            msgs[0].content = sysText;
-            msgs[1].role    = "user";
-            msgs[1].content = userText.c_str();
-
-            int needed = llama_chat_apply_template(tmpl, msgs, 2,
+            int needed = llama_chat_apply_template(tmpl, chat_msgs.data(), (int) chat_msgs.size(),
                                                     /*add_ass=*/true,
                                                     nullptr, 0);
             if (needed > 0) {
                 std::vector<char> buf((size_t) needed + 1, 0);
-                int written = llama_chat_apply_template(tmpl, msgs, 2,
+                int written = llama_chat_apply_template(tmpl, chat_msgs.data(), (int) chat_msgs.size(),
                                                          /*add_ass=*/true,
                                                          buf.data(), (int32_t) buf.size());
                 if (written > 0) {
@@ -366,12 +400,14 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
         }
 
         if (full.empty()) {
-            full =
-                std::string("<|im_start|>system\n") + sysText +
-                "<|im_end|>\n"
-                "<|im_start|>user\n" + userText +
-                "<|im_end|>\n"
-                "<|im_start|>assistant\n";
+            // Fallback: manual ChatML for all messages
+            std::string fallback;
+            for (size_t i = 0; i < chat_msgs.size(); i++) {
+                fallback += std::string("<|im_start|>") + chat_msgs[i].role +
+                    "\n" + chat_msgs[i].content + "<|im_end|>\n";
+            }
+            fallback += "<|im_start|>assistant\n";
+            full = std::move(fallback);
         }
     }
 
@@ -397,6 +433,26 @@ Java_com_example_cagent_llm_LlmEngine_complete(JNIEnv *env, jobject /*thiz*/,
         return env->NewStringUTF("Tokenization failed");
     }
     tokens.resize(n_tok);
+
+    // Safety clamp: n_tok must not exceed n_ctx, otherwise llama_decode fails
+    // because batch positions exceed the KV cache window. This is a last resort —
+    // the Kotlin trimMessages() should handle it at message boundaries.
+    const uint32_t max_ctx = llama_n_ctx(e->ctx);
+    // Leave room for generation so we don't fill the entire context with prompt.
+    const uint32_t max_prompt = std::min(max_ctx, max_ctx - 256u);
+    if ((uint32_t) n_tok > max_prompt) {
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+                            "complete: prompt too large (%d tokens > max_prompt=%u), truncating oldest tokens "
+                            "at message boundary risk",
+                            n_tok, max_prompt);
+        // Truncate from the start. This may split a message mid-token, but
+        // is better than a hard decode failure. The model should still cope
+        // since ChatML markers appear per-message.
+        const int32_t keep = (int32_t) max_prompt;
+        std::memmove(tokens.data(), tokens.data() + (n_tok - keep), (size_t) keep * sizeof(llama_token));
+        n_tok = keep;
+        tokens.resize(n_tok);
+    }
 
     __android_log_print(ANDROID_LOG_INFO, TAG,
                         "complete: prompt_chars=%zu n_tok=%d first=%d last=%d",

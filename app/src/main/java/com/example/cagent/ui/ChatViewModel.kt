@@ -108,6 +108,70 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private fun serializeMessages(messages: List<ChatMessage>): String {
+        return buildString {
+            for (msg in messages) {
+                // Skip empty assistant messages (the streaming placeholder)
+                if (msg.role == Role.Assistant && msg.text.isEmpty()) continue
+                append(1.toChar()) // SOH delimiter
+                append(msg.role.name.lowercase())
+                append(1.toChar())
+                append(msg.text)
+            }
+            append(1.toChar()) // trailing delimiter
+        }
+    }
+
+    /**
+     * Trim old conversation turns to stay within the LLM's n_ctx budget.
+     *
+     * We use a conservative char-based estimate (~3 chars/token) and reserve
+     * room for the assistant's response (~768 tokens). Always keep the system
+     * message, then keep as many recent user/assistant pairs as fit.
+     */
+    private fun trimMessages(messages: List<ChatMessage>): List<ChatMessage> {
+        val estimatedNctx = if (handle != 0L) DEFAULT_CTX else DEFAULT_CTX
+        val maxPromptTokens = estimatedNctx - 768
+        val charsPerToken = 3
+        val budget = maxPromptTokens * charsPerToken
+
+        // System message is always kept.
+        val systemMsgs = messages.filter { it.role == Role.System }
+        val conversation = messages.filter { it.role != Role.System }
+
+        val systemChars = systemMsgs.sumOf { it.text.length }
+        val totalChars = systemChars + conversation.sumOf { it.text.length }
+        if (totalChars <= budget) return messages
+
+        // Build (user, assistant) pairs from newest to oldest, keep until budget fills.
+        val nonSystem = conversation.toMutableList()
+        val keptNewestFirst = mutableListOf<Pair<ChatMessage?, ChatMessage?>>()
+        var usedChars = systemChars
+
+        while (nonSystem.isNotEmpty()) {
+            val assistant = nonSystem.removeLastOrNull()
+            val user = nonSystem.removeLastOrNull()
+            if (user == null && assistant == null) break
+
+            val turnChars = (user?.text?.length ?: 0) + (assistant?.text?.length ?: 0)
+            // Always keep at least one turn even if it exceeds budget.
+            val isLastTurn = keptNewestFirst.isEmpty()
+            if (!isLastTurn && usedChars + turnChars > budget) break
+
+            keptNewestFirst.add(user to assistant)
+            usedChars += turnChars
+        }
+
+        // Restore chronological order.
+        val kept = mutableListOf<ChatMessage>()
+        for ((user, assistant) in keptNewestFirst.asReversed()) {
+            user?.let { kept.add(it) }
+            assistant?.let { kept.add(it) }
+        }
+
+        return systemMsgs + kept
+    }
+
     fun updateDraft(text: String) {
         _state.value = _state.value.copy(draft = text)
     }
@@ -175,8 +239,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
             val raw = try {
                 withContext(llmDispatcher) {
+                    val trimmed = trimMessages(_state.value.messages)
+                    val history = serializeMessages(trimmed)
                     try {
-                        engine.complete(handle, prompt, callback)
+                        engine.complete(handle, history, callback)
                     } catch (t: Throwable) {
                         Log.e(tag, "engine.complete threw", t)
                         "[Error] ${t::class.java.simpleName}: ${t.message}"

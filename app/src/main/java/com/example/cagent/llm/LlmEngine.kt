@@ -27,7 +27,7 @@ class LlmEngine {
      * (concatenation of all callback pieces) for callers that don't care about
      * streaming.
      */
-    external fun complete(handle: Long, prompt: String, callback: TokenCallback?): String
+    external fun complete(handle: Long, messages: String, callback: TokenCallback?): String
 
     companion object {
         init {

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx gitnexus *)",
+      "Bash(gitnexus query *)",
+      "Bash(gitnexus context *)",
+      "Bash(xargs cat *)",
+      "Bash(python3 *)",
+      "Bash(git checkout *)"
+    ]
+  }
+}
